@@ -1,12 +1,12 @@
 import Fastify from "fastify";
 import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
-import compress from "@fastify/compress";
 import { loadModule } from "cld3-asm";
 
 // ---- config (env-friendly) ----
 const PORT = Number(process.env.PORT || 7860);
-const HOST = "0.0.0.0";
+// Jeśli serwis ma być tylko lokalnie (host network + Flowise), ustaw HOST=127.0.0.1
+const HOST = process.env.HOST || "127.0.0.1";
 
 const BODY_LIMIT = Number(process.env.BODY_LIMIT || 64 * 1024); // 64KB
 const CACHE_MAX = Number(process.env.CACHE_MAX || 5000);        // 0 = off
@@ -14,8 +14,14 @@ const MIN_LEN = Number(process.env.MIN_LEN || 10);              // 0 = off
 const CLD_MIN_BYTES = Number(process.env.CLD_MIN_BYTES || 0);
 const CLD_MAX_BYTES = Number(process.env.CLD_MAX_BYTES || 1000);
 
+// Przytnij wejście (ważne, jeśli ktoś wyśle historię czatu)
+const MAX_INPUT_CHARS = Number(process.env.MAX_INPUT_CHARS || 4000);
+
 const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 0); // 0 = off
 const RATE_LIMIT_TIME = process.env.RATE_LIMIT_TIME || "1 minute";
+
+// Logowanie potrafi zjadać CPU przy dużym RPS
+const LOGGER = process.env.LOGGER === "1";
 
 // ---- tiny LRU (no deps) ----
 class LRU {
@@ -43,18 +49,25 @@ class LRU {
 
 const cache = new LRU(CACHE_MAX);
 
+// ---- fast hash for cache keys (FNV-1a 32-bit) ----
+function fnv1a(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
 // ---- fastify instance ----
 const app = Fastify({
-  logger: true,          // w HF logi lecą do podglądu
-  bodyLimit: BODY_LIMIT, // chroni przed dużymi payloadami
-  trustProxy: true       // HF jest za proxy
+  logger: LOGGER,
+  bodyLimit: BODY_LIMIT,
+  trustProxy: true
 });
 
-// Security headers (tanie, rozsądne)
+// Security headers (tanie, rozsądne). CSP wyłączone, bo to API.
 await app.register(helmet, { contentSecurityPolicy: false });
-
-// Kompresja odpowiedzi (małe JSONy => marginalnie, ale bezpieczne)
-await app.register(compress, { global: true });
 
 // Rate limit (opcjonalnie)
 if (RATE_LIMIT_MAX > 0) {
@@ -70,7 +83,7 @@ let identifier = null;
 async function initDetector() {
   const factory = await loadModule();
   identifier = factory.create(CLD_MIN_BYTES, CLD_MAX_BYTES);
-  app.log.info({ CLD_MIN_BYTES, CLD_MAX_BYTES }, "cld3-asm ready");
+  app.log?.info?.({ CLD_MIN_BYTES, CLD_MAX_BYTES }, "cld3-asm ready");
 }
 
 await initDetector();
@@ -85,63 +98,70 @@ app.get("/ready", async (req, reply) => {
 
 // ---- classify ----
 // POST { "text": "...", "topN": 1|3|5 }  (topN optional)
-app.post("/classify", {
-  schema: {
-    body: {
-      type: "object",
-      required: ["text"],
-      properties: {
-        text: { type: "string", minLength: 1 },
-        topN: { type: "integer", minimum: 1, maximum: 10 }
-      },
-      additionalProperties: false
+app.post(
+  "/classify",
+  {
+    schema: {
+      body: {
+        type: "object",
+        required: ["text"],
+        properties: {
+          text: { type: "string", minLength: 1 },
+          topN: { type: "integer", minimum: 1, maximum: 10 }
+        },
+        additionalProperties: false
+      }
     }
-  }
-}, async (req, reply) => {
-  if (!identifier) return reply.code(503).send({ error: "Detector not ready yet." });
+  },
+  async (req, reply) => {
+    if (!identifier) return reply.code(503).send({ error: "Detector not ready yet." });
 
-  const text = req.body.text.trim();
-  if (!text) return reply.code(400).send({ error: "Empty 'text'." });
+    const topN = req.body.topN || 1;
 
-  // opcjonalny fast-fail dla krótkich wejść (usuń, jeśli chcesz zawsze wynik)
-  if (MIN_LEN > 0 && text.length < MIN_LEN) {
-    return {
+    // normalizacja wejścia + przycięcie
+    const raw = String(req.body.text ?? "");
+    const text = raw.trim().slice(0, MAX_INPUT_CHARS);
+
+    if (!text) return reply.code(400).send({ error: "Empty 'text'." });
+
+    // fast-fail dla krótkich wejść (opcjonalnie)
+    if (MIN_LEN > 0 && text.length < MIN_LEN) {
+      return {
+        input_len: text.length,
+        cld3: topN === 1
+          ? { language: "und", probability: 0, is_reliable: false, proportion: 0 }
+          : []
+      };
+    }
+
+    // cache key: topN + hash + length (nie trzymamy całego tekstu jako klucza)
+    const key = `${topN}:${fnv1a(text)}:${text.length}`;
+    const hit = cache.get(key);
+    if (hit) return hit;
+
+    let result;
+    if (topN === 1) {
+      result = identifier.findLanguage(text);
+    } else {
+      result = identifier.findMostFrequentLanguages(text, topN);
+    }
+
+    const out = {
       input_len: text.length,
-      cld3: { language: "und", probability: 0, is_reliable: false, proportion: 0 }
+      cld3: result
     };
+
+    cache.set(key, out);
+    return out;
   }
-
-  // cache key uwzględnia topN
-  const topN = req.body.topN || 1;
-  const key = topN === 1 ? text : `${topN}\u0000${text}`;
-
-  const hit = cache.get(key);
-  if (hit) return hit;
-
-  let result;
-  if (topN === 1) {
-    result = identifier.findLanguage(text);
-  } else {
-    // top-N (bardziej użyteczne dla mieszanego tekstu)
-    result = identifier.findMostFrequentLanguages(text, topN);
-  }
-
-  const out = {
-    input_len: text.length,
-    cld3: result
-  };
-
-  cache.set(key, out);
-  return out;
-});
+);
 
 // ---- graceful shutdown ----
 async function shutdown(signal) {
   try {
-    app.log.info({ signal }, "shutting down");
+    app.log?.info?.({ signal }, "shutting down");
     await app.close();
   } finally {
-    // cld3-asm wspiera dispose na identyfikatorze
     try { identifier?.dispose?.(); } catch {}
     process.exit(0);
   }
